@@ -14,7 +14,7 @@ busca full-text. Massa de dados real do baseline público do PubMed.
 
 ## Arquitetura
 
-![Diagrama](https://github.com/user-attachments/assets/dcb64bf7-894b-4b14-8794-99fa1ec70cdf)
+![Diagrama](https://github.com/user-attachments/assets/fc071142-31c7-4363-9fe8-eb4bdcc3ed12)
 
 Write e read side não se conhecem diretamente, a única ponte é o tópico Kafka.
 O read model pode ser reconstruído do zero a qualquer momento reprocessando o
