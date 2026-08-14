@@ -84,19 +84,21 @@ infraestrutura em Docker na mesma máquina):
 | Lag de projeção (Kafka → ES) | ~6ms por evento |
 | Latência de bulk index (ES) | ~3ms por lote |
 
-O gargalo está no write side, não no read side: a ingestão sequencial
-(parsing StAX + `find`/`persistOrUpdate` no Mongo + publish no Kafka, artigo a
-artigo) roda a ~22ms por artigo, um teto de ~45 artigos/s. O read side, com
-consumo em lote e Bulk API, processa bem mais rápido do que o write side
-consegue alimentar — na prática os lotes chegam com poucos itens porque o
-Kafka nunca acumula backlog suficiente entre polls. Otimizar o read side além
-deste ponto não move o throughput fim a fim; o próximo ganho real está em
-paralelizar ou batchar a ingestão.
+O gargalo estava no write side: parsing StAX + `find`/`persistOrUpdate` no
+Mongo + publish no Kafka, artigo a artigo, a ~22ms por artigo — um teto de
+~45 artigos/s. O read side, com consumo em lote e Bulk API, processava mais
+rápido do que o write side conseguia alimentar; os lotes chegavam com poucos
+itens porque o Kafka nunca acumulava backlog suficiente entre polls.
+ 
+**Depois (write-side batchado via `bulkWrite` no Mongo):** o gargalo foi
+eliminado — a escrita deixou de ser o teto do pipeline.
+ 
+Lag de projeção (Kafka → ES) e latência de bulk index no Elasticsearch se
+mantiveram nos mesmos ~6ms e ~3ms por lote observados antes; a mudança não
+afetou o read side, só removeu o represamento anterior.
 
 ## Limitações conhecidas / débito técnico
 
-- Ingestão write-side é sequencial (um artigo por vez); não há batching de
-  escrita no Mongo nem paralelização do parsing.
 - `hasChanges()` compara documento completo a cada reimport — correto para o
   volume atual, torna-se um custo relevante em lotes muito maiores.
 - Sem testes de integração automatizados (Testcontainers) — validação até
