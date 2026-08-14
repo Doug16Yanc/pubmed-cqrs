@@ -42,7 +42,14 @@ public class ElasticsearchIndexInitializer {
                             .properties("publicationDate", p -> p.date(d -> d.format("yyyy-MM-dd")))
                             .properties("meshTerms", p -> p.keyword(k -> k))
                             .properties("version", p -> p.long_(l -> l))
-                            .properties("projectedAt", p -> p.date(d -> d))));
+                            .properties("projectedAt", p -> p.date(d -> d))
+                            // all-MiniLM-L6-v2 = 384 dim. Se trocar pro PubMedBERT
+                            // (ver LocalEmbeddingModelProducer), mudar pra 768 aqui —
+                            // e recriar o índice, dimensão não é mapping update.
+                            .properties("embedding", p -> p.denseVector(dv -> dv
+                                    .dims(384)
+                                    .index(true)
+                                    .similarity("cosine")))));
 
             LOG.infof("Índice '%s' criado com sucesso", INDEX);
         } catch (TransportException e) {

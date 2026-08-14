@@ -1,25 +1,41 @@
 #!/usr/bin/env bash
 #
-# Baixa arquivos baseline do PubMed com verificação de integridade (checksum MD5)
-# e retomada em caso de falha. Idempotente: pula arquivos já baixados e íntegros.
+# Baixa arquivos do PubMed com verificação de integridade (checksum MD5) e retomada
+# em caso de falha. Idempotente: pula arquivos já baixados e íntegros.
 #
 # Uso:
 #   ./download-baseline.sh <diretório-destino> <número1> [número2] [número3] ...
 #
-# Exemplo (baixa os 2 primeiros arquivos, ~30-60 mil artigos):
+# Exemplo (baixa os 2 primeiros arquivos do baseline — artigos mais antigos):
 #   ./download-baseline.sh ./pubmed-data 1 2
 #
-# Variável de ambiente opcional:
+# Exemplo (artigos recentes — update files, mesmo formato XML, incremental diário):
+#   SOURCE=updates ./download-baseline.sh ./pubmed-data 1335 1336
+#
+# Variáveis de ambiente opcionais:
 #   YEAR_PREFIX (padrão: 26, referente ao baseline 2026 -> arquivos pubmed26nXXXX.xml.gz)
+#   SOURCE      (padrão: baseline. Use "updates" pra pegar update files — artigos
+#                novos/revisados publicados depois do corte do baseline anual. O
+#                primeiro update file de 2026 é o pubmed26n1335; a NLM anuncia o
+#                número mais recente em https://www.nlm.nih.gov/pubs/techbull —
+#                procure por "PubMed Update" ou confira o índice em
+#                https://ftp.ncbi.nlm.nih.gov/pubmed/updatefiles/)
 
 set -euo pipefail
 
-BASE_URL="https://ftp.ncbi.nlm.nih.gov/pubmed/baseline"
 YEAR_PREFIX="${YEAR_PREFIX:-26}"
+SOURCE="${SOURCE:-baseline}"
+
+case "$SOURCE" in
+  baseline) BASE_URL="https://ftp.ncbi.nlm.nih.gov/pubmed/baseline" ;;
+  updates)  BASE_URL="https://ftp.ncbi.nlm.nih.gov/pubmed/updatefiles" ;;
+  *) echo "SOURCE inválido: '$SOURCE' (use 'baseline' ou 'updates')" >&2; exit 1 ;;
+esac
 
 if [ $# -lt 2 ]; then
   echo "Uso: $0 <diretório-destino> <número1> [número2] ..." >&2
   echo "Ex:  $0 ./pubmed-data 1 2" >&2
+  echo "Ex (recentes): SOURCE=updates $0 ./pubmed-data 1335 1336" >&2
   exit 1
 fi
 

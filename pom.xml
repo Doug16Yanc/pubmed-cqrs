@@ -75,6 +75,13 @@
       <artifactId>quarkus-elasticsearch-java-client</artifactId>
     </dependency>
 
+    <!-- Busca semântica / RAG — embedding local, in-process (ONNX), sem chave de API -->
+    <dependency>
+      <groupId>dev.langchain4j</groupId>
+      <artifactId>langchain4j-embeddings-all-minilm-l6-v2-q</artifactId>
+      <version>1.17.0-beta27</version>
+    </dependency>
+
     <!-- Tolerance -->
     <dependency>
       <groupId>io.quarkus</groupId>

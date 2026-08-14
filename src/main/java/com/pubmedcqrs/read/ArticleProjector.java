@@ -6,6 +6,11 @@ import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pubmedcqrs.events.ArticleEvent;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.output.Response;
+import io.smallrye.common.annotation.Blocking;
 import io.smallrye.reactive.messaging.kafka.KafkaRecord;
 import io.smallrye.reactive.messaging.kafka.KafkaRecordBatch;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -33,6 +38,9 @@ public class ArticleProjector {
     @Inject
     ObjectMapper objectMapper;
 
+    @Inject
+    EmbeddingModel embeddingModel;
+
     /**
      * Consome um lote de eventos (configurado via
      * mp.messaging.incoming.article-events-in.batch=true) e indexa todos de uma vez
@@ -41,6 +49,8 @@ public class ArticleProjector {
      * não é uma unidade atômica de sucesso/falha, só uma otimização de transporte.
      */
     @Incoming("article-events-in")
+    @Blocking // o embedding agora roda in-process (ONNX/CPU), não é mais uma chamada de
+    // rede — mas ainda é trabalho pesado o bastante pra não rodar no event loop.
     public CompletionStage<Void> onArticleEventBatch(KafkaRecordBatch<String, String> batch) {
         List<KafkaRecord<String, String>> records = new ArrayList<>();
         batch.forEach(records::add);
@@ -66,16 +76,19 @@ public class ArticleProjector {
             return CompletableFuture.completedFuture(null);
         }
 
+        List<float[]> embeddings = embedBatch(parsed);
+
         BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
-        for (ParsedEvent pe : parsed) {
-            ArticleEvent event = pe.event();
+        for (int i = 0; i < parsed.size(); i++) {
+            ArticleEvent event = parsed.get(i).event();
+            float[] embedding = embeddings.get(i);
             bulkBuilder.operations(op -> op
-                    .index(i -> i
+                    .index(idx -> idx
                             .index(INDEX)
                             .id(event.pmid())
                             .versionType(VersionType.External)
                             .version(event.version())
-                            .document(toDocument(event))
+                            .document(toDocument(event, embedding))
                     )
             );
         }
@@ -128,7 +141,43 @@ public class ArticleProjector {
         );
     }
 
-    private Object toDocument(ArticleEvent event) {
+    /**
+     * Embeda o lote inteiro numa única chamada (embedAll) em vez de artigo por artigo.
+     * Mesmo local/in-process, o modelo ONNX paraleliza internamente entre os
+     * TextSegments de uma chamada embedAll (um thread por segmento, thread pool
+     * cacheado) — chamar em lote aproveita esse paralelismo em vez de serializar
+     * uma inferência de cada vez.
+     *
+     * Título + abstract concatenados: embedding de abstract sozinho perde contexto do
+     * título, e são poucos tokens a mais.
+     */
+    private List<float[]> embedBatch(List<ParsedEvent> parsed) {
+        List<TextSegment> segments = new ArrayList<>(parsed.size());
+        for (ParsedEvent pe : parsed) {
+            ArticleEvent event = pe.event();
+            String title = event.title() == null ? "" : event.title();
+            String abstractText = event.abstractText() == null ? "" : event.abstractText();
+            String text = (title + ". " + abstractText).trim();
+            // embedAll não aceita segmento vazio; artigo sem título nem abstract
+            // (raro, mas existe no baseline) ainda precisa de um vetor pra não
+            // quebrar o alinhamento posicional da lista de resultados.
+            segments.add(TextSegment.from(text.isBlank() ? "[sem conteúdo]" : text));
+        }
+
+        long embedStart = System.nanoTime();
+        Response<List<Embedding>> response = embeddingModel.embedAll(segments);
+        long embedMs = (System.nanoTime() - embedStart) / 1_000_000;
+        LOG.infof("Embeddings gerados: %d artigos em %dms (%.1f artigos/s)",
+                parsed.size(), embedMs, parsed.size() / Math.max(1.0, embedMs / 1000.0));
+
+        List<float[]> vectors = new ArrayList<>(parsed.size());
+        for (Embedding embedding : response.content()) {
+            vectors.add(embedding.vector());
+        }
+        return vectors;
+    }
+
+    private Object toDocument(ArticleEvent event, float[] embedding) {
         Instant projectedAt = Instant.now();
         long lagMs = Duration.between(event.occurredAt(), projectedAt).toMillis();
         LOG.debugf("PMID %s — lag de projeção: %dms", event.pmid(), lagMs);
@@ -142,7 +191,8 @@ public class ArticleProjector {
                 event.publicationDate(),
                 event.meshTerms(),
                 event.version(),
-                projectedAt.toString()
+                projectedAt.toString(),
+                embedding
         );
     }
 
@@ -157,6 +207,7 @@ public class ArticleProjector {
             String publicationDate,
             List<String> meshTerms,
             long version,
-            String projectedAt
+            String projectedAt,
+            float[] embedding
     ) {}
 }
