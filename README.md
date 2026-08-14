@@ -1,93 +1,105 @@
-# PubMed CQRS POC
+# PubMed CQRS PoC
 
-POC de CQRS: MongoDB (write model) → Kafka/Redpanda (eventos) → Elasticsearch (read model),
-usando artigos do PubMed como massa de dados.
+PoC de arquitetura CQRS event-driven: MongoDB como write model, Kafka (Redpanda)
+como espinha dorsal de eventos, Elasticsearch como read model otimizado para
+busca full-text. Massa de dados real do baseline público do PubMed.
 
 ## Stack
 
-- Java 25 + Quarkus 3.33 LTS
-- MongoDB (write model, fonte da verdade)
-- Redpanda (compatível com protocolo Kafka)
-- Elasticsearch (read model, busca full-text/facetas)
+- Java 25 + Quarkus 3.33 LTS.
+- MongoDB — write model, fonte da verdade.
+- Kafka — event bus entre write e read side.
+- Elasticsearch — read model, busca full-text e facetada.
+- MicroProfile Fault Tolerance (`@Retry`) — resiliência na indexação.
 
-## Como rodar
+## Arquitetura
 
-1. Suba a infraestrutura:
+![Diagrama](https://github.com/user-attachments/assets/dcb64bf7-894b-4b14-8794-99fa1ec70cdf)
 
-   ```bash
-   docker compose up -d
-   ```
+Write e read side não se conhecem diretamente, a única ponte é o tópico Kafka.
+O read model pode ser reconstruído do zero a qualquer momento reprocessando o
+tópico desde o início, sem tocar no write model.
 
-   Isso sobe Mongo (27017), Redpanda (9092, console em http://localhost:8090)
-   e Elasticsearch (9200, Kibana em http://localhost:5601).
+## Decisões de design
 
-2. Rode a aplicação em modo dev:
+**Idempotência via versionamento externo + diff de conteúdo.** Cada evento
+carrega um `version` incremental. O `ArticleProjector` indexa no ES com
+`version_type=external`: o Elasticsearch rejeita nativamente (`409`) qualquer
+versão igual ou anterior à já indexada, sem lógica de deduplicação na
+aplicação. No write side, `ArticleCommandService` só incrementa a versão e
+publica evento novo se o conteúdo de fato mudou (comparação campo a campo) —
+reimportar o mesmo artigo sem alteração é um no-op silencioso, não gera
+ruído no Kafka.
 
-   ```bash
-   ./mvnw quarkus:dev
-   ```
+**Falha parcial não derruba o consumer.** O read side consome em lote
+(`KafkaRecordBatch`) e indexa via Bulk API, mas cada mensagem é reconhecida
+(`ack`/`nack`) individualmente com base no resultado item-a-item que o
+Elasticsearch devolve. Um `409` de conflito de versão é tratado como sucesso
+(idempotência esperada); uma falha real de indexação vai para uma dead-letter
+queue (`article-events-dlq`) sem bloquear o restante do lote. Falha de
+transporte (Elasticsearch indisponível) aciona retry com backoff
+(`@Retry`, 3 tentativas) antes de escalar para DLQ.
 
-   > Nota: este esqueleto foi gerado sem acesso à internet no momento da criação,
-   > então a primeira build vai precisar baixar as dependências do Maven Central
-   > normalmente. Ajuste `quarkus.platform.version` no `pom.xml` para a última
-   > patch da 3.33 LTS disponível quando for buildar.
+**Parsing XML em streaming.** O baseline do PubMed é distribuído em arquivos
+`.xml.gz` de dezenas de milhares de artigos. O parser usa StAX
+(`XMLStreamReader`) para nunca materializar o arquivo inteiro em memória —
+o custo de memória do import é O(1) em relação ao tamanho do arquivo.
 
-## Testando o fluxo
-
-**Ingerir um artigo (write side):**
-
-```bash
-curl -X POST http://localhost:8080/articles \
-  -H "Content-Type: application/json" \
-  -d '{
-    "pmid": "12345678",
-    "title": "Machine learning applications in cheminformatics",
-    "abstractText": "This study explores...",
-    "authors": ["Silva J", "Souza M"],
-    "journal": "Journal of Cheminformatics",
-    "publicationDate": "2024-03-15",
-    "meshTerms": ["Machine Learning", "Cheminformatics", "Drug Discovery"]
-  }'
-```
-
-**Consultar (read side, via Elasticsearch):**
+## Executando
 
 ```bash
-curl "http://localhost:8080/articles/search?q=cheminformatics"
-curl "http://localhost:8080/articles/search/12345678"
+docker compose up -d   # Mongo :27017, Redpanda :9092 (console :8090), ES :9200 (Kibana :5601)
+./mvnw quarkus:dev
 ```
 
-Repare que existe uma pequena defasagem entre o POST (grava no Mongo + publica evento)
-e o artigo ficar pesquisável no ES (consistência eventual) — essa é uma métrica
-interessante para medir no POC.
+### Massa de dados
 
-## Roteiro sugerido de experimentos
+```bash
+./scripts/download-baseline.sh ./pubmed-data 1
+```
 
-1. **Idempotência / reentrega**: publique manualmente o mesmo evento duas vezes no
-   tópico `article-events` (via Redpanda Console, http://localhost:8090) com o mesmo
-   `version` — o segundo deve ser rejeitado pelo Elasticsearch (409, versionamento
-   externo) e logado como no-op no `ArticleProjector`.
-2. **Fora de ordem**: publique um evento com `version` menor que o já indexado e
-   confirme que ele é descartado.
-3. **Rebuild do read model**: zere o índice do ES (`DELETE /articles`) e reprocesse
-   o tópico do zero (resetando o `group.id` do consumer) para reconstruir o read
-   model inteiro a partir do Kafka — um mini "event sourcing replay".
-4. **Carga**: use o endpoint `/articles/batch` para ingerir um lote de artigos
-   (baixados via PubMed E-utilities ou baseline files) e meça:
-   - Lag entre gravação no Mongo e disponibilidade no ES
-   - Latência de `search` no ES vs. uma query equivalente direto no Mongo
-   - Throughput do consumer sob carga (via métricas do Redpanda Console)
+Baixa um arquivo do baseline (~20-30 mil artigos) com verificação de checksum
+e retomada em caso de falha.
 
-## Dados do PubMed
+### Import
 
-Para volume de teste, uns 10k–50k artigos de um baseline file do PubMed já são
-suficientes para observar diferenças de performance sem precisar baixar milhões
-de registros. Se for usar a API E-utilities (esearch/efetch) em vez dos baseline
-dumps, respeite o rate limit do NCBI (3 req/s sem API key, 10 req/s com key).
+```bash
+curl -X POST "http://localhost:8080/api/import/pubmed?dir=./pubmed-data&file=pubmed26n0001.xml.gz&limit=2000"
+```
 
-## Próximos passos (não incluídos neste esqueleto)
+`dir`/`file` mira um arquivo específico; omitir `file` processa todo o
+diretório. `limit` é um teto por arquivo, não uma garantia — artigos sem
+PMID ou título são descartados no parsing e não contam para o limite alcançado
+em termos de posição no XML.
 
-- Script de importação em lote a partir de arquivos XML do PubMed baseline
-- Dead-letter queue para eventos malformados no projector
-- Testes de integração com Testcontainers (Mongo + Redpanda + ES)
-- Métricas (Micrometer) para medir lag de projeção e latência de query
+## Performance observada
+
+Import completo de um arquivo baseline (30.000 artigos, hardware local,
+infraestrutura em Docker na mesma máquina):
+
+| Métrica | Valor |
+|---|---|
+| Tempo total | 425s |
+| Throughput médio | ~70 artigos/s |
+| Lag de projeção (Kafka → ES) | ~6ms por evento |
+| Latência de bulk index (ES) | ~3ms por lote |
+
+O gargalo está no write side, não no read side: a ingestão sequencial
+(parsing StAX + `find`/`persistOrUpdate` no Mongo + publish no Kafka, artigo a
+artigo) roda a ~22ms por artigo, um teto de ~45 artigos/s. O read side, com
+consumo em lote e Bulk API, processa bem mais rápido do que o write side
+consegue alimentar — na prática os lotes chegam com poucos itens porque o
+Kafka nunca acumula backlog suficiente entre polls. Otimizar o read side além
+deste ponto não move o throughput fim a fim; o próximo ganho real está em
+paralelizar ou batchar a ingestão.
+
+## Limitações conhecidas / débito técnico
+
+- Ingestão write-side é sequencial (um artigo por vez); não há batching de
+  escrita no Mongo nem paralelização do parsing.
+- `hasChanges()` compara documento completo a cada reimport — correto para o
+  volume atual, torna-se um custo relevante em lotes muito maiores.
+- Sem testes de integração automatizados (Testcontainers) — validação até
+  aqui foi manual, via logs e consultas diretas ao Mongo/Elasticsearch.
+- Sem métricas exportadas (Micrometer/Prometheus) — números de performance
+  acima vieram de logs instrumentados manualmente, não de um painel.
