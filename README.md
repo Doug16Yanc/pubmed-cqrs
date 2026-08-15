@@ -10,6 +10,8 @@ busca full-text. Massa de dados real do baseline público do PubMed.
 - MongoDB — write model, fonte da verdade.
 - Kafka — event bus entre write e read side.
 - Elasticsearch — read model, busca full-text e facetada.
+- LangChain4j + ONNX Runtime — embeddings in-process, sem chamada de rede.
+- all-MiniLM-L6-v2 (quantizado) — modelo de sentence embedding, 384 dimensões.
 - MicroProfile Fault Tolerance (`@Retry`) — resiliência na indexação.
 
 ## Arquitetura
@@ -20,6 +22,33 @@ Write e read side não se conhecem diretamente, a única ponte é o tópico Kafk
 O read model pode ser reconstruído do zero a qualquer momento reprocessando o
 tópico desde o início, sem tocar no write model.
 
+## Busca semântica
+
+Além do full-text tradicional, o `ArticleProjector` gera um embedding
+(all-MiniLM-L6-v2, via LangChain4j + ONNX Runtime, rodando in-process na JVM)
+para cada artigo no momento da indexação, armazenado como campo
+`dense_vector` (384 dim, similaridade cosseno) no Elasticsearch.
+
+```http
+GET /articles/search?q=...&mode=text      # BM25 puro
+GET /articles/search?q=...&mode=semantic  # kNN sobre o dense_vector
+GET /articles/search?q=...&mode=hybrid    # combina os dois scores
+```
+
+`hybrid` costuma ser o modo mais robusto na prática: o componente léxico
+(BM25) corrige casos onde o embedding aproxima demais textos que só
+compartilham vocabulário genérico do domínio biomédico, sem perder a
+capacidade do semântico de casar sinônimos e paráfrases que o full-text
+sozinho não pega.
+
+- Sem métricas exportadas (Micrometer/Prometheus) — números de performance
+   acima vieram de logs instrumentados manualmente, não de um painel.
+- Modelo de embedding fixo em 384 dimensões (all-MiniLM-L6-v2) — trocar por
+  um modelo maior/domain-specific exige recriar o índice do zero
+  (dimensão de vetor não é um mapping update no Elasticsearch) e tem custo de CPU
+  proporcionalmente maior, sem garantia de ganho de relevância no volume
+  atual de dados.
+  
 ## Decisões de design
 
 **Idempotência via versionamento externo + diff de conteúdo.** Cada evento
@@ -39,6 +68,7 @@ Elasticsearch devolve. Um `409` de conflito de versão é tratado como sucesso
 queue (`article-events-dlq`) sem bloquear o restante do lote. Falha de
 transporte (Elasticsearch indisponível) aciona retry com backoff
 (`@Retry`, 3 tentativas) antes de escalar para DLQ.
+
 
 **Parsing XML em streaming.** O baseline do PubMed é distribuído em arquivos
 `.xml.gz` de dezenas de milhares de artigos. O parser usa StAX
