@@ -127,6 +127,21 @@ Lag de projeção (Kafka → ES) e latência de bulk index no Elasticsearch se
 mantiveram nos mesmos ~6ms e ~3ms por lote observados antes; a mudança não
 afetou o read side, só removeu o represamento anterior.
 
+### Embeddings e trade-off de performance
+
+Com a introdução da busca semântica, o read side passou a ter um custo adicional
+de CPU para geração dos embeddings. O `all-MiniLM-L6-v2` é executado in-process
+via ONNX Runtime, então a projeção ficou um pouco mais lenta do que a versão
+anterior sem embeddings.
+
+Esse custo foi deliberadamente aceito em troca da busca semântica. Para o
+volume e objetivo desta PoC, o ganho de relevância e a capacidade de busca por
+similaridade compensam o pequeno gargalo introduzido no read side.
+
+A escolha também foi validada empiricamente: modelos biomédicos maiores e
+fine-tunados apresentaram maior custo computacional no ambiente local, sem
+ganho de relevância suficiente para justificar o aumento de infraestrutura.
+
 ## Limitações conhecidas / débito técnico
 
 - `hasChanges()` compara documento completo a cada reimport — correto para o
